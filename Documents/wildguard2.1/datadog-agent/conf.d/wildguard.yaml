@@ -1,0 +1,16 @@
+init_config:
+
+instances:
+  - host: redis
+    port: 6379
+    keys:
+      - wg:raw:iot
+      - wg:raw:gps
+      - wg:raw:weather
+      - wg:raw:airquality
+      - wg:bronze:out
+      - wg:etl:out
+      - wg:silver:out
+      - wg:gold:kpis
+      - wg:gold:alerts
+      - wg:gold:ml

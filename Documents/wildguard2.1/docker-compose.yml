@@ -1,0 +1,416 @@
+version: "3.9"
+
+# ============================================================
+#  WildGuard Chile – Orquestación Docker Compose
+#  Pipeline: Sensores (MQTT) → Mosquitto → mqtt-bridge
+#            → Redis Streams → Bronze → ETL → Silver → Gold
+#            → Analítica → Alertas → Dashboard
+# ============================================================
+
+networks:
+  wg-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  elasticsearch-data:
+  mosquitto-data:
+  mosquitto-log:
+
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  # INFRAESTRUCTURA BASE
+  # ─────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: wg-postgres
+    networks: [wg-net]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: wg-redis
+    networks: [wg-net]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Mosquitto MQTT Broker ────────────────────────────────────
+  # Equivale a AWS IoT Core (parte del broker)
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: wg-mosquitto
+    networks: [wg-net]
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    ports:
+      - "1883:1883"    # MQTT
+      - "9001:9001"    # WebSockets
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/#' -C 1 -i healthcheck -W 3"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: wg-elasticsearch
+    networks: [wg-net]
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q 'green\\|yellow'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────────────────────────
+  # 1 & 2A. FUENTES DE DATOS – SENSORES IoT (MQTT)
+  # ─────────────────────────────────────────────────────────────
+
+  sensor-simulator:
+    build: ./sensor-simulator
+    container_name: wg-sensor-simulator
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      DD_SERVICE: sensor-simulator
+      DD_AGENT_HOST: datadog-agent
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"sensor-simulator"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 2A. IoT Core + Rules Engine + Timestream (simulado)
+  # ─────────────────────────────────────────────────────────────
+
+  mqtt-bridge:
+    build: ./mqtt-bridge
+    container_name: wg-mqtt-bridge
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      DD_SERVICE: mqtt-bridge
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8075
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8075:8075"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"mqtt-bridge"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 2B. FUENTES DE DATOS – APIs EXTERNAS (Open-Meteo)
+  # ─────────────────────────────────────────────────────────────
+
+  weather-api:
+    build: ./weather-api
+    container_name: wg-weather-api
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: weather-api
+      DD_AGENT_HOST: datadog-agent
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"weather-api"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. STREAMING & MENSAJERÍA (reemplaza Kinesis)
+  # ─────────────────────────────────────────────────────────────
+
+  redis-streams:
+    build: ./redis-streams
+    container_name: wg-redis-streams
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: redis-streams
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8070
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8070:8070"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"redis-streams"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. DATA LAKE BRONZE
+  # ─────────────────────────────────────────────────────────────
+
+  bronze-layer:
+    build: ./bronze-layer
+    container_name: wg-bronze-layer
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: bronze-layer
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mqtt-bridge:
+        condition: service_started
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"bronze-layer"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 5. PROCESAMIENTO & ETL
+  # ─────────────────────────────────────────────────────────────
+
+  etl-processor:
+    build: ./etl-processor
+    container_name: wg-etl-processor
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: etl-processor
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8082
+    depends_on:
+      bronze-layer:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"etl-processor"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 6. DATA LAKE SILVER
+  # ─────────────────────────────────────────────────────────────
+
+  silver-layer:
+    build: ./silver-layer
+    container_name: wg-silver-layer
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: silver-layer
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8083
+    depends_on:
+      etl-processor:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"silver-layer"}]'
+
+
+  # ─────────────────────────────────────────────────────────────
+  # 6.5 DATA LAKE GOLD (Redshift + QuickSight + EventBridge)
+  # ─────────────────────────────────────────────────────────────
+
+  gold-layer:
+    build: ./gold-layer
+    container_name: wg-gold-layer
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: gold-layer
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8087
+      GOLD_KPI_WINDOW_S: 30
+    depends_on:
+      silver-layer:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8087:8087"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"gold-layer"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 7. ANALÍTICA & CONSUMO
+  # ─────────────────────────────────────────────────────────────
+
+  analytics:
+    build: ./analytics
+    container_name: wg-analytics
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: analytics
+      DD_AGENT_HOST: datadog-agent
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      HTTP_PORT: 8084
+    depends_on:
+      gold-layer:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "8084:8084"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"analytics"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # ML SIMULATOR (SageMaker)
+  # ─────────────────────────────────────────────────────────────
+
+  ml-simulator:
+    build: ./ml-simulator
+    container_name: wg-ml-simulator
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: ml-simulator
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8085
+    depends_on:
+      silver-layer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"ml-simulator"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 8. ALERTAS & EVENTOS (EventBridge + SNS)
+  # ─────────────────────────────────────────────────────────────
+
+  alert-service:
+    build: ./alert-service
+    container_name: wg-alert-service
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: alert-service
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8086
+    depends_on:
+      silver-layer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    ports:
+      - "8086:8086"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"alert-service"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # 9. DASHBOARD WILDGUARD (Cliente Final)
+  # ─────────────────────────────────────────────────────────────
+
+  dashboard:
+    build: ./dashboard
+    container_name: wg-dashboard
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: dashboard
+      DD_AGENT_HOST: datadog-agent
+      HTTP_PORT: 8080
+    depends_on:
+      gold-layer:
+        condition: service_started
+      analytics:
+        condition: service_started
+      alert-service:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"dashboard"}]'
+
+  # ─────────────────────────────────────────────────────────────
+  # OBSERVABILIDAD – Datadog Agent
+  # ─────────────────────────────────────────────────────────────
+
+  datadog-agent:
+    build: ./datadog-agent
+    container_name: wg-datadog-agent
+    networks: [wg-net]
+    environment:
+      DD_API_KEY: ${DD_API_KEY}
+      DD_SITE: ${DD_SITE}
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
+      DD_CONTAINER_EXCLUDE: "name:wg-datadog-agent"
+      DD_APM_ENABLED: "true"
+      DD_APM_NON_LOCAL_TRAFFIC: "true"
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      DD_PROCESS_AGENT_ENABLED: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
+      - ./datadog-agent/conf.d:/etc/datadog-agent/conf.d
+    ports:
+      - "8125:8125/udp"
+      - "8126:8126"
+    restart: unless-stopped

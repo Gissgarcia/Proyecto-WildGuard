@@ -1,0 +1,11 @@
+# APM / Tracing config for WildGuard
+apm_config:
+  enabled: true
+  apm_non_local_traffic: true
+  analyzed_spans:
+    wildguard|bronze.ingest: 1
+    wildguard|silver.process: 1
+    wildguard|etl.lambda_stream: 1
+    wildguard|alert.evaluate: 1
+    wildguard|ml.inference: 1
+    wildguard|mqtt.publish: 1
