@@ -215,7 +215,7 @@ def on_message(client, userdata, msg):
             _redis_client.xadd(stream, flat_event, maxlen=8000)
             counters["forwarded"] += 1
 
-            statsd.increment("wg.mqtt_bridge.forwarded",
+            metrics.increment("mqtt_bridge.forwarded",
                              tags=[f"stream:{stream.replace(':', '_')}",
                                    f"topic:{topic.split('/')[2] if '/' in topic else topic}"])
 
