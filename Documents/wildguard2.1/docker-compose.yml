@@ -373,7 +373,7 @@ services:
     environment:
       DD_SERVICE: dashboard
       DD_AGENT_HOST: datadog-agent
-      HTTP_PORT: 8080
+      HTTP_PORT: 8088
     depends_on:
       gold-layer:
         condition: service_started
@@ -382,7 +382,7 @@ services:
       alert-service:
         condition: service_started
     ports:
-      - "8080:8080"
+      - "8088:8088"
     restart: unless-stopped
     labels:
       com.datadoghq.ad.logs: '[{"source":"python","service":"dashboard"}]'
