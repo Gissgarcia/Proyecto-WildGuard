@@ -34,6 +34,7 @@ from typing import Optional
 
 import redis
 from telemetry import init_telemetry, get_tracer, get_logger
+from datadog import statsd
 
 metrics = init_telemetry("weather-api")
 tracer  = get_tracer()
