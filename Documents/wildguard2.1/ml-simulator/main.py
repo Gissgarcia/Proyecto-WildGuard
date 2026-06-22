@@ -31,13 +31,6 @@ metrics = init_telemetry("ml-simulator")
 tracer  = get_tracer()
 log     = get_logger("ml-simulator")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [ml-simulator] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("ml-simulator")
-
 REDIS_HOST    = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT    = int(os.getenv("REDIS_PORT", 6379))
 PG_HOST       = os.getenv("POSTGRES_HOST", "postgres")

@@ -350,6 +350,20 @@ services:
       DD_SERVICE: alert-service
       DD_AGENT_HOST: datadog-agent
       HTTP_PORT: 8086
+      TELEGRAM_ENABLED: "true"
+      TELEGRAM_BOT_TOKEN: "dummy"
+      TELEGRAM_CHAT_ID: "dummy"
+      SLACK_ENABLED: "true"
+      SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/dummy"
+      EMAIL_ENABLED: "true"
+      SMTP_HOST: "smtp.example.com"
+      SMTP_PORT: "587"
+      SMTP_USER: "dummy"
+      SMTP_PASSWORD: "dummy"
+      SMTP_FROM: "dummy@example.com"
+      SMTP_TO_ALERTS: "dummy@example.com"
+      EMAIL_FROM: "dummy@example.com"
+      EMAIL_TO: "dummy@example.com"
     depends_on:
       silver-layer:
         condition: service_started
@@ -390,6 +404,57 @@ services:
   # ─────────────────────────────────────────────────────────────
   # OBSERVABILIDAD – Datadog Agent
   # ─────────────────────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────────────────────
+  # 10. PIPELINE VALIDATION (pruebas de integración)
+  # ─────────────────────────────────────────────────────────────
+
+  pipeline-validation:
+    build: ./pipeline-validation
+    container_name: wg-pipeline-validation
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: pipeline-validation
+      DD_AGENT_HOST: datadog-agent
+      TELEGRAM_ENABLED: "true"
+      TELEGRAM_BOT_TOKEN: "dummy"
+      TELEGRAM_CHAT_ID: "dummy"
+      SLACK_ENABLED: "true"
+      SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/dummy"
+      EMAIL_ENABLED: "true"
+      SMTP_HOST: "smtp.example.com"
+      SMTP_PORT: "587"
+      SMTP_USER: "dummy"
+      SMTP_PASSWORD: "dummy"
+      SMTP_FROM: "dummy@example.com"
+      SMTP_TO_ALERTS: "dummy@example.com"
+      EMAIL_FROM: "dummy@example.com"
+      EMAIL_TO: "dummy@example.com"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+      bronze-layer:
+        condition: service_started
+      etl-processor:
+        condition: service_started
+      silver-layer:
+        condition: service_started
+      gold-layer:
+        condition: service_started
+      alert-service:
+        condition: service_started
+      dashboard:
+        condition: service_started
+    restart: "no"
+    profiles:
+      - validation
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"pipeline-validation"}]'
 
   datadog-agent:
     build: ./datadog-agent

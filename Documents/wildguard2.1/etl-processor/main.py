@@ -44,17 +44,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import redis
 import psycopg2
 from telemetry import init_telemetry, get_tracer, get_logger
+from datadog import statsd
 
 metrics = init_telemetry("etl-processor")
 tracer  = get_tracer()
 log     = get_logger("etl-processor")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [etl-processor] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("etl-processor")
 
 REDIS_HOST    = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT    = int(os.getenv("REDIS_PORT", 6379))

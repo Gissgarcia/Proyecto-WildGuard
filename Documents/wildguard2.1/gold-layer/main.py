@@ -125,6 +125,7 @@ def connect_pg():
                 user=PG_USER, password=PG_PASS, connect_timeout=5
             )
             conn.autocommit = True
+            ensure_fire_risk_tables(conn)
             metrics.service_check("postgres.connection", 0, "PostgreSQL connected")
             log.info("PostgreSQL conectado (Gold schema)")
             return conn
@@ -133,6 +134,39 @@ def connect_pg():
             metrics.service_check("postgres.connection", 2, str(e))
             time.sleep(4)
     raise RuntimeError("No se pudo conectar a PostgreSQL")
+
+
+def ensure_fire_risk_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS gold.fire_risk_current (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                zone VARCHAR(80) UNIQUE NOT NULL,
+                fwi_score NUMERIC(5,3) NOT NULL DEFAULT 0,
+                risk_level VARCHAR(10) NOT NULL DEFAULT 'LOW',
+                temperature_c NUMERIC(7,2),
+                humidity_pct NUMERIC(6,2),
+                wind_kmh NUMERIC(7,2),
+                source VARCHAR(30),
+                layer VARCHAR(10) DEFAULT 'GOLD'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS gold.fire_risk_history (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                zone VARCHAR(80) NOT NULL,
+                fwi_score NUMERIC(5,3) NOT NULL,
+                risk_level VARCHAR(10) NOT NULL,
+                temperature_c NUMERIC(7,2),
+                humidity_pct NUMERIC(6,2),
+                wind_kmh NUMERIC(7,2),
+                source VARCHAR(30),
+                silver_id UUID,
+                layer VARCHAR(10) DEFAULT 'GOLD'
+            )
+        """)
 
 
 def connect_redis() -> redis.Redis:
@@ -342,6 +376,69 @@ def persist_alert(conn, alert: dict, silver_id: str) -> str:
         return alert_id
 
 
+# ── fire_risk_current / fire_risk_history ─────────────────────
+def persist_fire_risk_current(conn, fields: dict):
+    with tracer.trace("gold.db.fire_risk_current", resource="gold.fire_risk_current") as span:
+        zone = fields.get("zone", "unknown")
+        fwi = float(fields.get("fwi", 0) or 0)
+        level = fields.get("riskLevel", "LOW")
+        source = fields.get("source", "UNKNOWN")
+        payload = {}
+        try:
+            payload = json.loads(fields.get("payload", "{}"))
+        except Exception:
+            pass
+        sql = """
+            INSERT INTO gold.fire_risk_current
+                (zone, fwi_score, risk_level, temperature_c, humidity_pct, wind_kmh, source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (zone) DO UPDATE SET
+                fwi_score = EXCLUDED.fwi_score,
+                risk_level = EXCLUDED.risk_level,
+                temperature_c = EXCLUDED.temperature_c,
+                humidity_pct = EXCLUDED.humidity_pct,
+                wind_kmh = EXCLUDED.wind_kmh,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                zone, fwi, level,
+                payload.get("temperatureC"),
+                payload.get("humidityPct"),
+                payload.get("windKmh"),
+                source,
+            ))
+
+
+def persist_fire_risk_history(conn, fields: dict):
+    with tracer.trace("gold.db.fire_risk_history", resource="gold.fire_risk_history") as span:
+        zone = fields.get("zone", "unknown")
+        fwi = float(fields.get("fwi", 0) or 0)
+        level = fields.get("riskLevel", "LOW")
+        source = fields.get("source", "UNKNOWN")
+        silver_id = fields.get("silverId", "")
+        payload = {}
+        try:
+            payload = json.loads(fields.get("payload", "{}"))
+        except Exception:
+            pass
+        sql = """
+            INSERT INTO gold.fire_risk_history
+                (zone, fwi_score, risk_level, temperature_c, humidity_pct, wind_kmh, source, silver_id, recorded_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                zone, fwi, level,
+                payload.get("temperatureC"),
+                payload.get("humidityPct"),
+                payload.get("windKmh"),
+                source,
+                silver_id if silver_id else None,
+            ))
+
+
 # ── Evaluación de alertas Gold ────────────────────────────────
 def evaluate_gold_alerts(fields: dict, conn, r: redis.Redis):
     """
@@ -530,7 +627,13 @@ def consumer_loop(r: redis.Redis, conn):
                             with kpi_lock:
                                 kpi_buffer.append(fields)
 
-                            # 2. Evaluar alertas Gold
+                            # 2. Persistir fire_risk_current (último estado por zona)
+                            persist_fire_risk_current(conn, fields)
+
+                            # 3. Persistir fire_risk_history (todos los eventos)
+                            persist_fire_risk_history(conn, fields)
+
+                            # 4. Evaluar alertas Gold
                             evaluate_gold_alerts(fields, conn, r)
 
                             r.xack(STREAM, GROUP, msg_id)

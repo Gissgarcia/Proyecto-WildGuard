@@ -36,13 +36,6 @@ metrics = init_telemetry("redis-streams")
 tracer  = get_tracer()
 log     = get_logger("redis-streams")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [redis-streams] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("redis-streams")
-
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 HTTP_PORT  = int(os.getenv("HTTP_PORT", 8070))

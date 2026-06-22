@@ -45,13 +45,6 @@ metrics = init_telemetry("analytics")
 tracer  = get_tracer()
 log     = get_logger("analytics")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [analytics] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("analytics")
-
 REDIS_HOST  = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT  = int(os.getenv("REDIS_PORT", 6379))
 PG_HOST     = os.getenv("POSTGRES_HOST", "postgres")

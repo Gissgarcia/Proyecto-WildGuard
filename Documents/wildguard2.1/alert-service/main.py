@@ -1,8 +1,18 @@
 """
-WildGuard – Alert Service (con telemetría Datadog completa)
-EventBridge + Lambda + SNS simulado.
+WildGuard – Alert Service con canales múltiples
+============================================================
+EventBridge + Lambda + SNS multi-canal.
+
+Canales de notificación:
+  - Telegram (bot API)
+  - Slack (Incoming Webhook)
+  - Email (SMTP)
+  - Webhook (HTTP POST genérico)
+
+Cada canal se activa si su variable de entorno está configurada.
 """
-import os, json, uuid, time, logging, threading, requests
+import os, json, uuid, time, logging, threading, requests, smtplib, ssl
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
@@ -22,25 +32,39 @@ PG_DB         = os.getenv("POSTGRES_DB", "wildguard")
 PG_USER       = os.getenv("POSTGRES_USER", "wildguard")
 PG_PASS       = os.getenv("POSTGRES_PASSWORD", "wg_secret_2024")
 HTTP_PORT     = int(os.getenv("HTTP_PORT", 8086))
-DASHBOARD_URL = os.getenv("ALERT_WEBHOOK_URL", "http://dashboard:8080/api/alerts/ingest")
+DASHBOARD_URL = os.getenv("ALERT_WEBHOOK_URL", "http://dashboard:8088/api/alerts/ingest")
+EXTERNAL_HOOK = os.getenv("ALERT_WEBHOOK_EXTERNAL", "")
 GROUP  = "alert-evaluator"
 STREAM = "wg:silver:out"
 
-counters = {"evaluated":0,"fired":0,"high":0,"critical":0,"suppressed":0,"errors":0}
+# ── Config canales de notificación ─────────────────────────────
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+SLACK_URL      = os.getenv("SLACK_WEBHOOK_URL", "")
+SMTP_HOST      = os.getenv("SMTP_HOST", "")
+SMTP_PORT      = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER      = os.getenv("SMTP_USER", "")
+SMTP_PASS      = os.getenv("SMTP_PASS", "")
+SMTP_FROM      = os.getenv("SMTP_FROM", "wildguard@wildguard.cl")
+SMTP_TO        = os.getenv("SMTP_TO_ALERTS", "")
+
+# ── Contadores y estado ────────────────────────────────────────
+counters = {"evaluated":0,"fired":0,"high":0,"critical":0,"suppressed":0,"errors":0,
+            "telegram_sent":0,"slack_sent":0,"email_sent":0,"webhook_sent":0}
 active_alerts: dict = {}
 alert_history: list = []
 
 ALERT_RULES = [
     {"id":"RULE-FWI-CRITICAL",  "condition": lambda p,fwi: fwi>=0.80,
-     "level":"CRITICAL", "message":"🔴 RIESGO CRÍTICO DE INCENDIO — Activar brigadas"},
+     "level":"CRITICAL", "message":"RIESGO CRITICO DE INCENDIO — Activar brigadas"},
     {"id":"RULE-FWI-HIGH",      "condition": lambda p,fwi: 0.60<=fwi<0.80,
-     "level":"HIGH",     "message":"🟠 RIESGO ALTO DE INCENDIO — Alerta preventiva"},
+     "level":"HIGH",     "message":"RIESGO ALTO DE INCENDIO — Alerta preventiva"},
     {"id":"RULE-TEMP-EXTREME",  "condition": lambda p,fwi: float(p.get("temperatureC") or 0)>=42,
-     "level":"HIGH",     "message":"🌡 TEMPERATURA EXTREMA detectada"},
+     "level":"HIGH",     "message":"TEMPERATURA EXTREMA detectada"},
     {"id":"RULE-SMOKE",         "condition": lambda p,fwi: float(p.get("smokeDensity") or 0)>=0.4,
-     "level":"CRITICAL", "message":"💨 HUMO DETECTADO — Posible incendio activo"},
+     "level":"CRITICAL", "message":"HUMO DETECTADO — Posible incendio activo"},
     {"id":"RULE-WIND",          "condition": lambda p,fwi: float(p.get("windKmh") or 0)>=70 and fwi>=0.5,
-     "level":"HIGH",     "message":"🌬 VIENTO PELIGROSO con riesgo elevado"},
+     "level":"HIGH",     "message":"VIENTO PELIGROSO con riesgo elevado"},
 ]
 DESTINATIONS = {
     "CRITICAL": ["CONAF","Brigadas-Forestales","Bomberos","Equipos-Regionales"],
@@ -99,7 +123,135 @@ def persist_alert(conn, alert, silver_id):
     return alert_id
 
 
+# ── Canales de notificación ────────────────────────────────────
+
+def send_telegram(alert: dict) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        return False
+    try:
+        text = (
+            f"*WildGuard Alerta*\n"
+            f"Nivel: {alert['riskLevel']}\n"
+            f"Zona: {alert['zone']}\n"
+            f"FWI: {alert.get('fwiScore', 0):.3f}\n"
+            f"Mensaje: {alert.get('message', '')}\n"
+            f"Hora: {alert.get('firedAt', '')}"
+        )
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT,
+            "text": text,
+            "parse_mode": "Markdown",
+        }, timeout=5)
+        ok = resp.status_code == 200
+        if ok:
+            counters["telegram_sent"] += 1
+            metrics.increment("alert.channel.telegram", tags=[f"level:{alert['riskLevel'].lower()}"])
+        return ok
+    except Exception as e:
+        log.error("Error enviando Telegram: %s", e)
+        return False
+
+
+def send_slack(alert: dict) -> bool:
+    if not SLACK_URL:
+        return False
+    try:
+        color = "#f87171" if alert["riskLevel"] == "CRITICAL" else "#fb923c"
+        payload = {
+            "attachments": [{
+                "color": color,
+                "title": f"WildGuard Alerta — {alert['riskLevel']}",
+                "text": alert.get("message", ""),
+                "fields": [
+                    {"title": "Zona", "value": alert["zone"], "short": True},
+                    {"title": "FWI", "value": f"{alert.get('fwiScore', 0):.3f}", "short": True},
+                    {"title": "Hora", "value": alert.get("firedAt", ""), "short": False},
+                ],
+                "footer": "WildGuard Chile",
+                "ts": time.time(),
+            }]
+        }
+        resp = requests.post(SLACK_URL, json=payload, timeout=5)
+        ok = resp.status_code == 200
+        if ok:
+            counters["slack_sent"] += 1
+            metrics.increment("alert.channel.slack", tags=[f"level:{alert['riskLevel'].lower()}"])
+        return ok
+    except Exception as e:
+        log.error("Error enviando Slack: %s", e)
+        return False
+
+
+def send_email(alert: dict) -> bool:
+    if not SMTP_HOST or not SMTP_TO:
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"WildGuard {alert['riskLevel']} — {alert['zone']}"
+        msg["From"] = SMTP_FROM
+        msg["To"] = SMTP_TO
+        body = (
+            f"ALERTA WILDGUARD\n"
+            f"{'='*40}\n"
+            f"Nivel: {alert['riskLevel']}\n"
+            f"Zona: {alert['zone']}\n"
+            f"FWI: {alert.get('fwiScore', 0):.3f}\n"
+            f"Temperatura: {alert.get('payload', {}).get('temperatureC', 'N/A')} °C\n"
+            f"Humedad: {alert.get('payload', {}).get('humidityPct', 'N/A')} %\n"
+            f"Viento: {alert.get('payload', {}).get('windKmh', 'N/A')} km/h\n"
+            f"Mensaje: {alert.get('message', '')}\n"
+            f"Hora: {alert.get('firedAt', '')}\n"
+            f"{'='*40}\n"
+            f"WildGuard Chile — Sistema de Monitoreo de Incendios Forestales"
+        )
+        msg.set_content(body)
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=ctx)
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        counters["email_sent"] += 1
+        metrics.increment("alert.channel.email", tags=[f"level:{alert['riskLevel'].lower()}"])
+        return True
+    except Exception as e:
+        log.error("Error enviando Email: %s", e)
+        return False
+
+
+def send_webhook(alert: dict) -> bool:
+    ok = False
+    for url in [DASHBOARD_URL, EXTERNAL_HOOK]:
+        if not url:
+            continue
+        try:
+            resp = requests.post(url, json=alert, timeout=3)
+            if resp.status_code in (200, 202):
+                ok = True
+        except Exception:
+            pass
+    if ok:
+        counters["webhook_sent"] += 1
+        metrics.increment("alert.channel.webhook", tags=[f"level:{alert['riskLevel'].lower()}"])
+    return ok
+
+
+def notify_all_channels(alert: dict):
+    """Envía la alerta por todos los canales configurados."""
+    channels = []
+    if send_telegram(alert):      channels.append("telegram")
+    if send_slack(alert):         channels.append("slack")
+    if send_email(alert):         channels.append("email")
+    if send_webhook(alert):       channels.append("webhook")
+    if channels:
+        log.info("Alerta enviada por: %s", ", ".join(channels),
+                 extra={"zone": alert["zone"], "risk_level": alert["riskLevel"]})
+    return channels
+
+
 def simulate_sns(alert):
+    """Simula SNS: escribe log + notifica canales + métrica."""
     level = alert["riskLevel"]; zone = alert["zone"]
     dests = DESTINATIONS.get(level, [])
     for dest in dests:
@@ -109,10 +261,8 @@ def simulate_sns(alert):
                            "fwi": alert.get("fwiScore",0)})
         metrics.increment("sns.notification_sent",
                           tags=[f"dest:{dest.lower()}",f"level:{level.lower()}"])
-    try:
-        requests.post(DASHBOARD_URL, json=alert, timeout=2)
-    except Exception:
-        pass
+    # Notificar por todos los canales configurados
+    notify_all_channels(alert)
     return dests
 
 
@@ -201,12 +351,35 @@ def consumer_loop(r, conn):
 
 
 class AlertHandler(BaseHTTPRequestHandler):
+    def is_telegram_configured(self):
+        if os.getenv("TELEGRAM_ENABLED","").lower()=="true": return True
+        return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT)
+    def is_slack_configured(self):
+        if os.getenv("SLACK_ENABLED","").lower()=="true": return True
+        return bool(SLACK_URL)
+    def is_email_configured(self):
+        if os.getenv("EMAIL_ENABLED","").lower()=="true": return True
+        return bool(SMTP_HOST and SMTP_TO)
+
     def do_GET(self):
+        tg = self.is_telegram_configured()
+        sl = self.is_slack_configured()
+        em = self.is_email_configured()
         if self.path=="/alerts":
             body=json.dumps({"active":list(active_alerts.items()),
                              "history":alert_history[:20],"stats":counters},default=str)
+        elif self.path=="/channels":
+            body=json.dumps({
+                "telegram": tg,
+                "slack": sl,
+                "email": em,
+                "webhook": bool(DASHBOARD_URL),
+                "webhook_external": bool(EXTERNAL_HOOK),
+                "counts": {k: counters[k] for k in ("telegram_sent","slack_sent","email_sent","webhook_sent")},
+            })
         else:
-            body=json.dumps({"status":"UP","component":"alert-service","stats":counters})
+            body=json.dumps({"status":"UP","component":"alert-service","stats":counters,"channels":{
+                "telegram":tg,"slack":sl,"email":em,"webhook":bool(DASHBOARD_URL)}})
         self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
         self.wfile.write(body.encode())
     def do_POST(self):

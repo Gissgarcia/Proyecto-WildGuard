@@ -7,3 +7,4 @@ datadog==0.47.0
 ddtrace==2.6.5
 wrapt==1.16.0
 psutil==5.9.8
+apscheduler==3.10.4

@@ -35,17 +35,12 @@ from typing import Optional
 import redis
 from telemetry import init_telemetry, get_tracer, get_logger
 from datadog import statsd
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 metrics = init_telemetry("weather-api")
 tracer  = get_tracer()
 log     = get_logger("weather-api")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [weather-api] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("weather-api")
 
 # ── Config ────────────────────────────────────────────────────
 REDIS_HOST     = os.getenv("REDIS_HOST", "redis")
@@ -311,91 +306,116 @@ def publish(r: redis.Redis, stream: str, source: str,
     r.xadd(stream, {k: str(v) for k, v in event.items()}, maxlen=3000)
 
 
+# ── Estado compartido ──────────────────────────────────────────
+_cycle = 0
+_r = None
+
+
+def fetch_all_zones():
+    """Ejecutado por APScheduler cada 5 minutos."""
+    global _cycle, _r
+    _cycle += 1
+    r = _r
+    ok_weather = ok_aq = errors = 0
+
+    for zone in ZONES:
+        weather = fetch_weather(zone)
+        if weather:
+            publish(r, "wg:raw:weather", "WEATHER", zone, weather)
+            ok_weather += 1
+
+            uv     = weather.get("uvIndex") or 0
+            temp   = weather.get("temperatureC") or 0
+            hum    = weather.get("humidityPct") or 0
+            wind   = weather.get("windKmh") or 0
+            gusts  = weather.get("windGustsKmh") or 0
+            wdesc  = weather.get("weatherDescription", "-")
+            et0    = weather.get("evapotranspirationMm") or 0
+            soil_t = weather.get("soilTempC") or 0
+
+            log.info(
+                "[ciclo %04d] WEATHER %-16s | "
+                "temp=%.1f°C hum=%.0f%% viento=%.1fkm/h ráfagas=%.1fkm/h "
+                "UV=%.1f ET0=%.2fmm suelo=%.1f°C | %s",
+                _cycle, zone["name"],
+                temp, hum, wind, gusts,
+                uv, et0, soil_t, wdesc
+            )
+
+            if uv >= 11:
+                log.warning("UV EXTREMO en %s: %.1f — riesgo de incendio elevado",
+                            zone["name"], uv)
+                statsd.event("WildGuard UV Extremo",
+                             f"UV={uv} en {zone['name']}", alert_type="warning")
+        else:
+            errors += 1
+
+        aq = fetch_air_quality(zone)
+        if aq:
+            publish(r, "wg:raw:airquality", "AIR_QUALITY", zone, aq)
+            ok_aq += 1
+            log.info(
+                "[ciclo %04d] AIR_QUALITY %-16s | "
+                "PM2.5=%.1f PM10=%.1f CO=%.0fppb AQI-EU=%s (%s)",
+                _cycle, zone["name"],
+                aq.get("pm25") or 0,
+                aq.get("pm10") or 0,
+                aq.get("carbonMonoxidePpb") or 0,
+                aq.get("europeanAqi") or "-",
+                aq.get("europeanAqiLevel") or "-",
+            )
+        else:
+            errors += 1
+
+        time.sleep(1.5)
+
+    statsd.increment("wg.weather.fetched",    ok_weather)
+    statsd.increment("wg.airquality.fetched", ok_aq)
+    statsd.increment("wg.weather.errors",     errors)
+    statsd.gauge("wg.stream.weather.len",    r.xlen("wg:raw:weather"))
+    statsd.gauge("wg.stream.airquality.len", r.xlen("wg:raw:airquality"))
+    statsd.gauge("wg.cache.size",            len(_cache))
+
+    log.info("[ciclo %04d] ── Resumen: weather=%d aq=%d errors=%d cache=%d",
+             _cycle, ok_weather, ok_aq, errors, len(_cache))
+
+
 # ── Main ──────────────────────────────────────────────────────
 def main():
     log.info("════════════════════════════════════════════════════")
-    log.info("  WildGuard Weather API – Open-Meteo iniciando")
+    log.info("  WildGuard Weather API – Open-Meteo (APScheduler)")
     log.info("  Forecast:    %s", WEATHER_URL)
     log.info("  Air Quality: %s", AQ_URL)
-    log.info("  Zonas: %d | Intervalo: %.0fs | Cache TTL: %ds",
-             len(ZONES), FETCH_INTERVAL, CACHE_TTL_SEC)
+    log.info("  Zonas: %d | Intervalo: 5min | Cache TTL: %ds",
+             len(ZONES), CACHE_TTL_SEC)
     log.info("════════════════════════════════════════════════════")
 
-    r = connect_redis()
-    init_streams(r)
+    global _r
+    _r = connect_redis()
+    init_streams(_r)
 
-    cycle = 0
-    while True:
-        cycle += 1
-        ok_weather = ok_aq = errors = 0
+    # Ejecutar primera carga inmediatamente
+    fetch_all_zones()
 
-        for zone in ZONES:
-            # ── Forecast (clima actual + próximas 6h) ──────────
-            weather = fetch_weather(zone)
-            if weather:
-                publish(r, "wg:raw:weather", "WEATHER", zone, weather)
-                ok_weather += 1
+    # Scheduler cada 5 minutos
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        fetch_all_zones,
+        trigger=IntervalTrigger(minutes=5),
+        id="fetch_weather",
+        name="Fetch Open-Meteo cada 5 min",
+        replace_existing=True,
+    )
+    scheduler.start()
+    log.info("APScheduler iniciado — fetch cada 5 minutos")
 
-                uv     = weather.get("uvIndex") or 0
-                temp   = weather.get("temperatureC") or 0
-                hum    = weather.get("humidityPct") or 0
-                wind   = weather.get("windKmh") or 0
-                gusts  = weather.get("windGustsKmh") or 0
-                wdesc  = weather.get("weatherDescription", "-")
-                et0    = weather.get("evapotranspirationMm") or 0
-                soil_t = weather.get("soilTempC") or 0
-
-                log.info(
-                    "[ciclo %04d] WEATHER %-16s | "
-                    "temp=%.1f°C hum=%.0f%% viento=%.1fkm/h ráfagas=%.1fkm/h "
-                    "UV=%.1f ET0=%.2fmm suelo=%.1f°C | %s",
-                    cycle, zone["name"],
-                    temp, hum, wind, gusts,
-                    uv, et0, soil_t, wdesc
-                )
-
-                # Emitir alerta si UV extremo o temperatura muy alta
-                if uv >= 11:
-                    log.warning("⚠ UV EXTREMO en %s: %.1f — riesgo de incendio elevado",
-                                zone["name"], uv)
-                    statsd.event("WildGuard UV Extremo",
-                                 f"UV={uv} en {zone['name']}", alert_type="warning")
-            else:
-                errors += 1
-
-            # ── Air Quality ────────────────────────────────────
-            aq = fetch_air_quality(zone)
-            if aq:
-                publish(r, "wg:raw:airquality", "AIR_QUALITY", zone, aq)
-                ok_aq += 1
-                log.info(
-                    "[ciclo %04d] AIR_QUALITY %-16s | "
-                    "PM2.5=%.1f PM10=%.1f CO=%.0fppb AQI-EU=%s (%s)",
-                    cycle, zone["name"],
-                    aq.get("pm25") or 0,
-                    aq.get("pm10") or 0,
-                    aq.get("carbonMonoxidePpb") or 0,
-                    aq.get("europeanAqi") or "-",
-                    aq.get("europeanAqiLevel") or "-",
-                )
-            else:
-                errors += 1
-
-            time.sleep(1.5)   # throttle entre zonas
-
-        # Métricas Datadog
-        statsd.increment("wg.weather.fetched",    ok_weather)
-        statsd.increment("wg.airquality.fetched", ok_aq)
-        statsd.increment("wg.weather.errors",     errors)
-        statsd.gauge("wg.stream.weather.len",    r.xlen("wg:raw:weather"))
-        statsd.gauge("wg.stream.airquality.len", r.xlen("wg:raw:airquality"))
-        statsd.gauge("wg.cache.size",            len(_cache))
-
-        log.info("[ciclo %04d] ── Resumen: weather=%d aq=%d errors=%d | "
-                 "cache_entries=%d",
-                 cycle, ok_weather, ok_aq, errors, len(_cache))
-
-        time.sleep(FETCH_INTERVAL)
+    # Mantener vivo
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        scheduler.shutdown()
+        log.info("Weather API detenido")
 
 
 if __name__ == "__main__":

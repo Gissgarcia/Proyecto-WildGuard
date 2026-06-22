@@ -41,13 +41,6 @@ metrics = init_telemetry("mqtt-bridge")
 tracer  = get_tracer()
 log     = get_logger("mqtt-bridge")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [mqtt-bridge] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
-log = logging.getLogger("mqtt-bridge")
-
 # ── Config ────────────────────────────────────────────────────
 MQTT_HOST  = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT  = int(os.getenv("MQTT_PORT", 1883))

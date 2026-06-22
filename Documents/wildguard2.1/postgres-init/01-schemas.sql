@@ -164,6 +164,62 @@ CREATE TABLE IF NOT EXISTS gold.ml_predictions (
     silver_id       UUID REFERENCES silver.processed_readings(id)
 );
 
+CREATE TABLE IF NOT EXISTS gold.fire_risk_current (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    zone            VARCHAR(80) UNIQUE NOT NULL,
+    region          VARCHAR(40),
+    latitude        NUMERIC(10,6),
+    longitude       NUMERIC(10,6),
+    altitude_m      NUMERIC(8,2),
+    -- FWI actual
+    fwi_score       NUMERIC(5,3) NOT NULL DEFAULT 0,
+    risk_level      VARCHAR(10) NOT NULL DEFAULT 'LOW',
+    -- Factores meteorológicos actuales
+    temperature_c   NUMERIC(7,2),
+    humidity_pct    NUMERIC(6,2),
+    wind_kmh        NUMERIC(7,2),
+    wind_gusts_kmh  NUMERIC(7,2),
+    precipitation_mm NUMERIC(7,2),
+    uv_index        NUMERIC(5,2),
+    soil_temp_c     NUMERIC(7,2),
+    soil_moisture   NUMERIC(6,3),
+    -- Tendencias
+    trend_direction VARCHAR(10) DEFAULT 'stable',  -- increasing | decreasing | stable
+    fwi_1h_ago      NUMERIC(5,3),
+    fwi_6h_ago      NUMERIC(5,3),
+    -- Metadatos
+    source          VARCHAR(30),
+    last_alert_at   TIMESTAMPTZ,
+    consecutive_warnings INTEGER DEFAULT 0,
+    layer           VARCHAR(10) DEFAULT 'GOLD'
+);
+
+CREATE TABLE IF NOT EXISTS gold.fire_risk_history (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    zone            VARCHAR(80) NOT NULL,
+    -- FWI histórico
+    fwi_score       NUMERIC(5,3) NOT NULL,
+    risk_level      VARCHAR(10) NOT NULL,
+    -- Factores contribuyentes
+    temperature_c   NUMERIC(7,2),
+    humidity_pct    NUMERIC(6,2),
+    wind_kmh        NUMERIC(7,2),
+    precipitation_mm NUMERIC(7,2),
+    uv_index        NUMERIC(5,2),
+    soil_temp_c     NUMERIC(7,2),
+    -- Fuente del dato
+    source          VARCHAR(30),
+    silver_id       UUID REFERENCES silver.processed_readings(id),
+    layer           VARCHAR(10) DEFAULT 'GOLD'
+);
+
+-- Particionamiento por mes para fire_risk_history (simulado con índices)
+CREATE INDEX idx_fire_risk_history_zone        ON gold.fire_risk_history(zone);
+CREATE INDEX idx_fire_risk_history_recorded_at ON gold.fire_risk_history(recorded_at DESC);
+CREATE INDEX idx_fire_risk_history_risk_level  ON gold.fire_risk_history(risk_level);
+
 CREATE INDEX idx_gold_alerts_zone   ON gold.fire_alerts(zone);
 CREATE INDEX idx_gold_alerts_level  ON gold.fire_alerts(risk_level);
 CREATE INDEX idx_gold_alerts_at     ON gold.fire_alerts(alert_at DESC);

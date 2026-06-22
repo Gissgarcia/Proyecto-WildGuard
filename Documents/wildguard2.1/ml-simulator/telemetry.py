@@ -197,6 +197,26 @@ class WildGuardMetrics:
             tags=self._tags(tags),
         )
 
+        # ── Pipeline stage throughput (por minuto) ──────────────
+    def record_throughput(self, stage: str, count: int = 1, tags: list[str] = None):
+        extra = [f"stage:{stage}"] + (tags or [])
+        self.increment("pipeline.throughput", count, tags=extra)
+
+    def gauge_throughput_rpm(self, stage: str, rpm: float, tags: list[str] = None):
+        extra = [f"stage:{stage}"] + (tags or [])
+        self.gauge("pipeline.throughput_rpm", rpm, tags=extra)
+
+    # ── End-to-end latency ─────────────────────────────────
+    def record_e2e_latency(self, latency_ms: float, source: str, zone: str = ""):
+        extra = [f"source:{source}"]
+        if zone: extra.append(f"zone:{zone}")
+        self.histogram("pipeline.e2e_latency_ms", latency_ms, tags=extra)
+
+    # ── Component health ───────────────────────────────────
+    def record_component_health(self, component: str, status: str):
+        self.gauge(f"health.{component}", 1 if status == "UP" else 0,
+                   tags=[f"status:{status}", f"component:{component}"])
+
     # ── Métricas de pipeline ──────────────────────────────────
     def record_ingestion(self, source: str, zone: str, success: bool = True):
         status = "ok" if success else "error"
