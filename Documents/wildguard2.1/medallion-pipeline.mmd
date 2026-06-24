@@ -1,0 +1,104 @@
+---
+title: WildGuard Data Pipeline - Arquitectura Medallion
+---
+flowchart TB
+  subgraph Fuentes["1. Fuentes de Datos"]
+    direction LR
+    SS["sensor-simulator<br/>(IoT MQTT)"]
+    WA["weather-api<br/>(Open-Meteo)"]
+    AQ["weather-api<br/>(Air Quality)"]
+  end
+
+  subgraph Streaming["2. Streaming & Mensajería"]
+    MQTT["Mosquitto MQTT"]
+    MB["mqtt-bridge"]
+    RS["redis-streams<br/>(Kinesis simulado)"]
+    RAW_IOT["wg:raw:iot"]
+    RAW_GPS["wg:raw:gps"]
+    RAW_WTH["wg:raw:weather"]
+    RAW_AQ["wg:raw:airquality"]
+  end
+
+  subgraph Bronze["3. Bronze Layer (Raw / Crudo)"]
+    BL["bronze-layer<br/>PostgreSQL schema: bronze"]
+    BRONZE_IOT["bronze.iot_readings<br/>(inmutable, SSE-S3-KMS)"]
+    BRONZE_API["bronze.api_readings<br/>(inmutable)"]
+    BRONZE_OUT["wg:bronze:out"]
+  end
+
+  subgraph ETL["4. ETL Processor (Lambda + Glue)"]
+    direction TB
+    ETL_LAMBDA["AWS Lambda Simulado<br/>- Validación esquema<br/>- Limpieza tipos<br/>- Enriquecimiento"]
+    ETL_GLUE["AWS Glue ETL Simulado<br/>- Cálculo FWI<br/>- Pseudonimización GPS<br/>- Deduplicación (MD5)<br/>- Quality Score"]
+    ETL_CATALOG["AWS Glue Data Catalog<br/>- Metadatos<br/>- Linaje (bronze_id)<br/>- Clasificación"]
+    ETL_OUT["wg:etl:out"]
+  end
+
+  subgraph Silver["5. Silver Layer (Procesado / Validado)"]
+    SL["silver-layer<br/>PostgreSQL schema: silver"]
+    SILVER_TABLE["silver.processed_readings<br/>(Parquet, trazable)"]
+    SILVER_OUT["wg:silver:out<br/>(fan-out a 3 consumers)"]
+  end
+
+  subgraph Gold["6. Gold Layer (Agregado / Analítico)"]
+    direction TB
+    GL["gold-layer<br/>(Redshift + QuickSight + EventBridge)"]
+    GOLD_KPI["gold.kpi_snapshots<br/>(ventana 30s)"]
+    GOLD_ALERTS_DB["gold.fire_alerts"]
+    GOLD_RISK_CUR["gold.fire_risk_current<br/>(último estado por zona)"]
+    GOLD_RISK_HIST["gold.fire_risk_history"]
+    GOLD_KPI_OUT["wg:gold:kpis"]
+    GOLD_ALERTS_OUT["wg:gold:alerts"]
+    GOLD_ML_OUT["wg:gold:ml"]
+  end
+
+  subgraph Consumo["7. Consumo"]
+    ML["ml-simulator<br/>(SageMaker FWI, AUC=0.82)"]
+    ALERT["alert-service<br/>(EventBridge + SNS)"]
+    ANALYTICS["analytics<br/>(Athena + Redshift + OpenSearch)"]
+    DASHBOARD["Dashboard<br/>(QuickSight - KPIs tiempo real)"]
+  end
+
+  subgraph Observabilidad["Observabilidad"]
+    DD["datadog-agent<br/>(APM + Logs + Métricas)"]
+  end
+
+  subgraph Infra["Infraestructura Base"]
+    PG[("PostgreSQL 15<br/>(Data Lake)")]
+    RD[("Redis 7<br/>(Streams)")]
+    ES[("Elasticsearch 8<br/>(OpenSearch)")]
+  end
+
+  SS -->|MQTT| MQTT --> MB --> RAW_IOT & RAW_GPS
+  WA --> RAW_WTH
+  AQ --> RAW_AQ
+
+  RAW_IOT & RAW_GPS & RAW_WTH & RAW_AQ -->|xreadgroup| BL
+
+  BL --> BRONZE_IOT & BRONZE_API
+  BL --> BRONZE_OUT
+
+  BRONZE_OUT -->|xreadgroup| ETL_LAMBDA --> ETL_GLUE --> ETL_CATALOG
+  ETL_CATALOG --> ETL_OUT
+
+  ETL_OUT -->|xreadgroup| SL
+  SL --> SILVER_TABLE
+  SL --> SILVER_OUT
+
+  SILVER_OUT -->|gold-aggregator| GL
+  SILVER_OUT -->|ml-inference| ML
+  SILVER_OUT -->|alert-evaluator| ALERT
+
+  GL --> GOLD_KPI & GOLD_ALERTS_DB & GOLD_RISK_CUR & GOLD_RISK_HIST
+  GL --> GOLD_KPI_OUT & GOLD_ALERTS_OUT & GOLD_ML_OUT
+
+  GOLD_KPI_OUT & GOLD_ALERTS_OUT & GOLD_ML_OUT --> DASHBOARD
+  GOLD_KPI_OUT & GOLD_ALERTS_DB --> ANALYTICS
+
+  ML --> GOLD_ML_OUT
+
+  PG --> BL & SL & GL & ANALYTICS
+  RD --> BL & SL & GL & ML & ALERT & RS
+  ES --> ANALYTICS
+
+  SS & WA & BL & ETL & SL & GL & ML & ALERT & DASHBOARD -->|APM / Logs / Métricas| DD
