@@ -163,6 +163,31 @@ services:
       com.datadoghq.ad.logs: '[{"source":"python","service":"weather-api"}]'
 
   # ─────────────────────────────────────────────────────────────
+  # 2C. FUENTES DE DATOS – CSV Loader
+  # ─────────────────────────────────────────────────────────────
+
+  csv-loader:
+    build: ./csv-loader
+    container_name: wg-csv-loader
+    networks: [wg-net]
+    env_file: .env
+    environment:
+      DD_SERVICE: csv-loader
+      DD_AGENT_HOST: datadog-agent
+      CSV_PATH: /data/test_fire_data.csv
+      CSV_DELAY_S: 2
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"python","service":"csv-loader"}]'
+
+  # ─────────────────────────────────────────────────────────────
   # 3. STREAMING & MENSAJERÍA (reemplaza Kinesis)
   # ─────────────────────────────────────────────────────────────
 
