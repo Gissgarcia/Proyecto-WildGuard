@@ -10,7 +10,9 @@ import os, json, uuid, time, logging, threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import redis, psycopg2
+import redis
+from redis.exceptions import ResponseError
+import psycopg2
 from telemetry import init_telemetry, get_tracer, get_logger
 
 metrics = init_telemetry("bronze-layer")
@@ -67,8 +69,12 @@ def ensure_groups(r):
     for stream in IOT_STREAMS + API_STREAMS:
         try:
             r.xgroup_create(stream, GROUP, id="0", mkstream=True)
-        except redis.ResponseError:
-            pass
+            log.info("Consumer group '%s' creado en stream '%s'", GROUP, stream)
+        except ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                log.debug("Consumer group '%s' ya existe en '%s'", GROUP, stream)
+            else:
+                log.warning("Error creando consumer group en '%s': %s", stream, e)
 
 
 def s3_path(source, payload, zone):
