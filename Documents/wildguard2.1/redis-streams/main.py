@@ -116,9 +116,9 @@ def collect_stream_stats(r: redis.Redis) -> dict:
                                 log.warning("⚠ LAG ALTO en '%s' group '%s': %d mensajes",
                                             stream, group, lag)
                                 stats["lag_alerts"] += 1
-                                statsd.event("WildGuard Stream Lag",
-                                             f"Stream {stream} lag={lag}",
-                                             alert_type="warning")
+                                metrics.event("WildGuard Stream Lag",
+                                              f"Stream {stream} lag={lag}",
+                                              alert_type="warning")
                 except Exception:
                     pass
             stream_stats[stream] = {"length": length, "groups": group_info}
@@ -139,10 +139,10 @@ def monitor_loop(r: redis.Redis):
 
             for stream, data in stream_data.items():
                 tag = f"stream:{stream.replace(':', '_')}"
-                statsd.gauge("wg.stream.length", data.get("length", 0), tags=[tag])
+                metrics.gauge("stream.length", data.get("length", 0), tags=[tag])
                 for g in data.get("groups", []):
-                    statsd.gauge("wg.stream.lag", g.get("lag", 0),
-                                 tags=[tag, f"group:{g['group']}"])
+                    metrics.gauge("stream.lag", g.get("lag", 0),
+                                  tags=[tag, f"group:{g['group']}"])
 
             log.info("Stream stats → total_len=%d streams=%d lag_alerts=%d",
                      stats["total_messages"], len(stream_data), stats["lag_alerts"])

@@ -221,9 +221,9 @@ def on_message(client, userdata, msg):
 
     # Métricas Datadog
     if counters["received"] % 50 == 0:
-        statsd.gauge("wg.mqtt_bridge.received",  counters["received"])
-        statsd.gauge("wg.mqtt_bridge.forwarded", counters["forwarded"])
-        statsd.gauge("wg.timestream.devices",    len(timestream))
+        metrics.gauge("mqtt_bridge.received",  counters["received"])
+        metrics.gauge("mqtt_bridge.forwarded", counters["forwarded"])
+        metrics.gauge("timestream.devices",    len(timestream))
 
 
 # ── HTTP API ──────────────────────────────────────────────────
